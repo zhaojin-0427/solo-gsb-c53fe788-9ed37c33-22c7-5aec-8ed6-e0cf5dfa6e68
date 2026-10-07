@@ -708,3 +708,181 @@ def test_missing_archived_csv_healed_on_identical_repost(client, ids):
 
 def test_acceptance_404_for_missing_report(client, ids):
     assert client.get("/api/acceptance/deadbeef").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 修色报告选区/偏移的整数语义、请求指纹矩形 ↔ 贴边裁剪选区对应
+# --------------------------------------------------------------------------
+
+def _rewrite_retouch_report(retouch_id, mutate):
+    """读取修色报告、按 mutate 改写后落盘；返回 (报告路径, 原始报告 dict)。"""
+    from app import main
+    rep_path = main.RETOUCH_DIR / retouch_id / "report.json"
+    original = json.loads(rep_path.read_text("utf-8"))
+    rep = json.loads(rep_path.read_text("utf-8"))
+    mutate(rep)
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    return rep_path, original
+
+
+def test_fractional_region_in_report_rejected_no_truncation(client, ids):
+    """归档报告把 x=4,width=1 改为 x=4.5,width=1.5：成品像素按截断选区本可
+    通过核验，但逐点预测会按分数选区划分选区内外（x=4 的测点被错划到选区
+    外而改取 lab_press.npy）——必须 422，绝不用 int() 截断默许。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rt = _retouch_reachable(client, job["job_id"], offset=(3, 0, 0, 0),
+                            rect=(4, 4, 1, 1), ids=ids)
+    assert rt["rect"] == {"x": 4, "y": 4, "width": 1, "height": 1}
+    rep_path, original = _rewrite_retouch_report(
+        rt["retouch_id"],
+        lambda rep: rep.update(
+            region={"x": 4.5, "y": 4.0, "width": 1.5, "height": 1.0}))
+    try:
+        r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                    retouch_id=rt["retouch_id"])
+        assert r.status_code == 422
+        assert "整数" in r.json()["detail"]
+    finally:
+        rep_path.write_text(json.dumps(original), "utf-8")
+
+
+def test_integral_float_and_boolean_region_rejected(client, ids):
+    """4.0 浮点写法与布尔坐标同样拒绝：报告选区只接受 JSON 整数。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rt = _retouch_reachable(client, job["job_id"], rect=(4, 4, 2, 2), ids=ids)
+    for bad_region in (
+        {"x": 4.0, "y": 4.0, "width": 2.0, "height": 2.0},
+        {"x": True, "y": 4, "width": 2, "height": 2},
+        {"x": 4, "y": 4, "width": 2, "height": False},
+        {"x": 4, "y": 4, "width": "2", "height": 2},
+    ):
+        rep_path, original = _rewrite_retouch_report(
+            rt["retouch_id"], lambda rep: rep.update(region=bad_region))
+        try:
+            r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                        retouch_id=rt["retouch_id"])
+            assert r.status_code == 422, bad_region
+            assert "整数" in r.json()["detail"]
+        finally:
+            rep_path.write_text(json.dumps(original), "utf-8")
+
+
+def test_fractional_boolean_and_out_of_range_offset_rejected(client, ids):
+    """偏移同样只接受合法整数：分数、布尔、超出单通道硬上限一律 422。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rt = _retouch_reachable(client, job["job_id"], rect=(4, 4, 2, 2), ids=ids)
+    for bad_offset in ([1.5, 0, 0, 0], [True, 0, 0, 0], [100, 0, 0, 0]):
+        rep_path, original = _rewrite_retouch_report(
+            rt["retouch_id"],
+            lambda rep: rep.update(best_offset_cmyk=bad_offset))
+        try:
+            r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                        retouch_id=rt["retouch_id"])
+            assert r.status_code == 422, bad_offset
+        finally:
+            rep_path.write_text(json.dumps(original), "utf-8")
+
+
+def test_region_must_match_request_fingerprint_clipped_rect(client, ids):
+    """报告选区必须等于请求指纹矩形贴边裁剪后的实际选区。
+
+    只改请求指纹矩形（选区与成品不动）：成品像素核验本可通过，
+    对应关系核对必须拦截（422）。
+    """
+    job = _run_job(client, ids, png=_gradient_png())
+    rt = _retouch_reachable(client, job["job_id"], rect=(4, 4, 2, 2), ids=ids)
+    # 请求指纹矩形被改：x=4→5，与报告选区 (4,4,2,2) 不再对应。
+    rep_path, original = _rewrite_retouch_report(
+        rt["retouch_id"], lambda rep: rep["request"].update(x=5))
+    try:
+        r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                    retouch_id=rt["retouch_id"])
+        assert r.status_code == 422
+        assert "选区" in r.json()["detail"]
+    finally:
+        rep_path.write_text(json.dumps(original), "utf-8")
+    # 报告选区被改成与请求指纹矩形不符的另一组整数。
+    rep_path, original = _rewrite_retouch_report(
+        rt["retouch_id"],
+        lambda rep: rep.update(region={"x": 5, "y": 4, "width": 2, "height": 2}))
+    try:
+        r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                    retouch_id=rt["retouch_id"])
+        assert r.status_code == 422
+    finally:
+        rep_path.write_text(json.dumps(original), "utf-8")
+
+
+def test_request_fingerprint_job_mismatch_rejected(client, ids):
+    """请求指纹绑定的原任务与所选任务不符 → 422。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rt = _retouch_reachable(client, job["job_id"], rect=(4, 4, 2, 2), ids=ids)
+    rep_path, original = _rewrite_retouch_report(
+        rt["retouch_id"], lambda rep: rep["request"].update(job_id="0" * 64))
+    try:
+        r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                    retouch_id=rt["retouch_id"])
+        assert r.status_code == 422
+    finally:
+        rep_path.write_text(json.dumps(original), "utf-8")
+
+
+def test_missing_request_fingerprint_rejected(client, ids):
+    """报告缺少请求指纹，无法核对选区与请求的对应 → 422。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rt = _retouch_reachable(client, job["job_id"], rect=(4, 4, 2, 2), ids=ids)
+    rep_path, original = _rewrite_retouch_report(
+        rt["retouch_id"], lambda rep: rep.pop("request"))
+    try:
+        r = _accept(client, job["job_id"], _csv([(4, 4, 50, 0, 0)]),
+                    retouch_id=rt["retouch_id"])
+        assert r.status_code == 422
+    finally:
+        rep_path.write_text(json.dumps(original), "utf-8")
+
+
+def test_edge_clipped_retouch_acceptance_uses_verified_clipped_region(client, ids):
+    """合法贴边修色：48×48 图上请求 (44,44,16,16) 的实际选区为 (44,44,4,4)。
+
+    验收必须按这份已验证的裁剪选区划分内外：角点 (44,44)/(47,47) 在选区
+    内（成品回算），(43,43) 在选区外（原任务预测值）；非零偏移下若误用
+    原任务值，选区内测点会在 limit=0 下超限，故合格结论也依赖正确划分。
+    """
+    job = _run_job(client, ids, png=_gradient_png())
+    job_id = job["job_id"]
+    rt = _retouch_reachable(client, job_id, offset=(2, 0, 0, 0),
+                            rect=(44, 44, 16, 16), ids=ids)
+    assert rt["rect"] == {"x": 44, "y": 44, "width": 4, "height": 4}
+    from app import main
+    press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    with Image.open(main.RETOUCH_DIR / rt["retouch_id"] / "retouched.tif") as im:
+        tiff = np.asarray(im)
+    lab_press = np.load(main.JOB_DIR / job_id / "lab_press.npy")
+
+    def product_lab(x, y):
+        return lcms_native.pixels_to_lab(
+            np.ascontiguousarray(tiff[y:y + 1, x:x + 1].reshape(1, 4)),
+            "CMYK", press, "relative_colorimetric")[0]
+
+    # 非零偏移确实移动了角点颜色（两条预测路径数值可区分）。
+    assert float(np.abs(np.asarray(product_lab(44, 44))
+                        - np.asarray(lab_press[44, 44])).max()) > 0.1
+
+    rows = [
+        (44, 44, *[float(v) for v in product_lab(44, 44)]),
+        (47, 47, *[float(v) for v in product_lab(47, 47)]),
+        (43, 43, *[float(v) for v in lab_press[43, 43]]),
+    ]
+    r = _accept(client, job_id, _csv(rows), limit=0.0,
+                retouch_id=rt["retouch_id"])
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["passed"] is True
+    assert [p["prediction_source"] for p in d["points"]] == [
+        "verified_retouched_product",
+        "verified_retouched_product",
+        "original_job_prediction",
+    ]
+    # 验收报告记录的是贴边裁剪后的实际选区（既有报告格式不变）。
+    assert d["report"]["retouch"]["region"] == \
+        {"x": 44, "y": 44, "width": 4, "height": 4}

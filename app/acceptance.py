@@ -7,9 +7,11 @@
 * **不使用修色**：逐点预测 Lab 直接取原任务 ``lab_press.npy``——它是分色
   CMYK 经原印刷 ICC 回算的逐像素预测值；
 * **绑定达标修色成品**：先对成品做**独立的内容绑定核验**（报告绑定本任务、
-  可达、印刷 ICC 摘要一致；``retouched.tif`` 解码后选区外与原分色逐字节
-  相同、选区内恰为报告所记录的统一整数偏移、嵌入的印刷 ICC 字节正确），
-  核验通过后：
+  可达、印刷 ICC 摘要一致；报告选区/偏移为**严格整数语义**——分数、布尔
+  一律拒绝，绝不 ``int()`` 截断默许；报告选区 == 修色**请求指纹**中的矩形
+  按任务幅面**贴边裁剪**后的实际选区；``retouched.tif`` 解码后选区外与原
+  分色逐字节相同、选区内恰为报告所记录的统一整数偏移、嵌入的印刷 ICC 字节
+  正确），核验通过后，**成品像素核验与逐点预测使用同一份已验证整数选区**：
 
   - 修色**选区内**测点：从**已核验成品**取该点 CMYK，按**原印刷 ICC 与原
     任务意图**回算为 Lab（策略 ``verified_product_backcalc``——成品选区经
@@ -33,8 +35,9 @@
 原件缺失或摘要不符，则用本次提交的同摘要字节原样修复后复用。
 
 下列情况一律拒绝验收（422/404），绝不用原任务值代替修色测点：修色不可达、
-修色报告或成品与任务/ICC 绑定不符、原印刷 ICC 缺失或摘要不符、测点越界、
-CSV 非法。
+修色报告或成品与任务/ICC 绑定不符、报告选区/偏移为分数或布尔等非整数、
+报告选区与请求指纹矩形贴边裁剪后的实际选区不符、原印刷 ICC 缺失或摘要
+不符、测点越界、CSV 非法。
 """
 from __future__ import annotations
 
@@ -240,6 +243,21 @@ def verify_press(press_bytes: bytes, digest: str | None) -> None:
         raise AcceptanceError(str(exc))
 
 
+def _strict_report_int(value: object, field: str) -> int:
+    """修色报告中的坐标/宽高/偏移必须是 JSON 整数。
+
+    分数（如 4.5，以及 4.0 这类浮点写法）、布尔、字符串等一律拒绝——
+    绝不用 ``int()`` 截断默许：截断会让成品像素核验按截断后的整数选区
+    通过，而逐点预测若按报告原始（分数）值划分选区内外，两条路径会对
+    同一测点给出不同的预测来源（解释分歧）。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AcceptanceError(
+            f"修色报告的「{field}」必须是整数（不接受分数/布尔/字符串），拒绝验收"
+        )
+    return value
+
+
 def verify_retouch_binding(
     retouch_id: str,
     retouch_base: Path,
@@ -253,13 +271,20 @@ def verify_retouch_binding(
 
     * 修色报告存在、结构完整、``reachable == true``、绑定的源任务就是本任务；
     * 报告记录的印刷 ICC SHA-256 == 当前原印刷 ICC 字节摘要；
+    * 报告选区与偏移为**严格整数语义**：坐标/宽高/四通道偏移必须是 JSON
+      整数（分数、布尔、字符串一律拒绝，绝不 ``int()`` 截断默许），且单
+      通道偏移绝对值不超过修色请求的硬上限 ``MAX_SHIFT_LIMIT``；
+    * 报告选区 == 修色**请求指纹**中的矩形按原任务幅面**贴边裁剪**后的
+      实际选区（与 :func:`retouch.clip_region` 同一语义：起点须在幅面内，
+      宽/高按实际交点裁剪），且请求指纹绑定的原任务就是本任务；
     * ``retouched.tif`` 存在、可打开、CMYK、尺寸与原任务一致、嵌入的印刷
       ICC 字节与当前原印刷 ICC 完全相同；
     * 解码后逐像素核对：报告选区**外**与原分色逐字节相同，选区**内**恰为
       “原分色 + 报告统一整数偏移”（夹到 0..255，与成品导出路径一致）。
 
     任一不符即拒绝验收，绝不在错误的成品上回算、也不用原任务值代替。
-    返回修色报告 dict（供取报告选区/偏移）。
+    返回带**已验证整数选区/偏移**的报告视图：下游逐点预测、报告绑定与
+    缓存复核使用的选区与上方像素核验所用完全相同（同一份已验证选区）。
     """
     report_path = retouch_base / "report.json"
     tiff_path = retouch_base / "retouched.tif"
@@ -289,17 +314,50 @@ def verify_retouch_binding(
     offset = rep.get("best_offset_cmyk")
     if not isinstance(region, dict) or not isinstance(offset, list) or len(offset) != 4:
         raise AcceptanceError("修色报告缺少有效的选区/偏移记录，拒绝验收")
+    # 严格整数语义：分数/布尔/字符串一律拒绝，绝不用 int() 截断默许。
     try:
-        x, y = int(region["x"]), int(region["y"])
-        rw, rh = int(region["width"]), int(region["height"])
-        off = np.asarray([int(v) for v in offset], dtype=np.int32)
-    except (KeyError, TypeError, ValueError):
-        raise AcceptanceError("修色报告的选区/偏移记录非法，拒绝验收")
+        x = _strict_report_int(region["x"], "选区 x")
+        y = _strict_report_int(region["y"], "选区 y")
+        rw = _strict_report_int(region["width"], "选区宽度")
+        rh = _strict_report_int(region["height"], "选区高度")
+        off_vals = [_strict_report_int(v, "CMYK 偏移") for v in offset]
+    except KeyError:
+        raise AcceptanceError("修色报告缺少有效的选区/偏移记录，拒绝验收")
+    # 合法修色报告的单通道偏移必在 ±MAX_SHIFT_LIMIT 内（修色请求校验的硬
+    # 约束）；先核对范围再转 int32，异常大整数也不会在转换时溢出。
+    if any(abs(v) > rt.MAX_SHIFT_LIMIT for v in off_vals):
+        raise AcceptanceError("修色报告的 CMYK 偏移超出单通道上限，拒绝验收")
+    off = np.asarray(off_vals, dtype=np.int32)
 
     H, W = cmyk_full.shape[:2]
     if not (0 <= x < W and 0 <= y < H and rw >= 1 and rh >= 1
             and x + rw <= W and y + rh <= H):
         raise AcceptanceError("修色报告选区超出原任务图像范围，拒绝验收")
+
+    # 报告选区必须等于“修色请求指纹中的矩形按原任务幅面贴边裁剪后的实际
+    # 选区”（与 retouch.clip_region 同一语义：起点在幅面内，宽/高按实际
+    # 交点裁剪——如 48×48 图上请求 (44,44,16,16) 的实际选区为 (44,44,4,4)）。
+    req_fp = rep.get("request")
+    if not isinstance(req_fp, dict):
+        raise AcceptanceError(
+            "修色报告缺少请求指纹，无法核对选区与请求的对应，拒绝验收"
+        )
+    if req_fp.get("job_id") != meta["job_id"]:
+        raise AcceptanceError("修色报告请求指纹绑定的原任务与所选任务不符，拒绝验收")
+    try:
+        qx = _strict_report_int(req_fp["x"], "请求指纹矩形 x")
+        qy = _strict_report_int(req_fp["y"], "请求指纹矩形 y")
+        qw = _strict_report_int(req_fp["width"], "请求指纹矩形宽度")
+        qh = _strict_report_int(req_fp["height"], "请求指纹矩形高度")
+    except KeyError:
+        raise AcceptanceError("修色报告请求指纹缺少矩形字段，拒绝验收")
+    if not (0 <= qx < W and 0 <= qy < H and qw >= 1 and qh >= 1):
+        raise AcceptanceError("修色报告请求指纹中的矩形非法，拒绝验收")
+    clipped = (qx, qy, min(W, qx + qw) - qx, min(H, qy + qh) - qy)
+    if (x, y, rw, rh) != clipped:
+        raise AcceptanceError(
+            "修色报告选区与请求指纹矩形贴边裁剪后的实际选区不符，拒绝验收"
+        )
 
     if not tiff_path.is_file():
         raise AcceptanceError("达标修色成品 retouched.tif 缺失，拒绝验收")
@@ -330,7 +388,14 @@ def verify_retouch_binding(
         raise AcceptanceError(
             "修色成品像素与“原分色 + 报告统一偏移（选区外字节不变）”不符，拒绝验收"
         )
-    return rep
+
+    # 返回“已验证视图”：选区/偏移即上方核验过的整数值。下游逐点预测、
+    # 报告绑定与缓存复核统一使用这份已验证选区——与像素核验完全同一份，
+    # 不存在“截断值核验、原始值预测”的第二套解释。
+    verified = dict(rep)
+    verified["region"] = {"x": x, "y": y, "width": rw, "height": rh}
+    verified["best_offset_cmyk"] = [int(v) for v in off_vals]
+    return verified
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +412,11 @@ def predicted_labs(
     """按策略返回每个测点的预测 Lab 与来源标记。
 
     无修色：全部取原任务 ``lab_press.npy``（``original_job_prediction``）。
-    绑定修色：报告选区内的点从已核验成品 TIFF 的 CMYK 经原印刷 ICC、原任务
-    意图回算（``verified_retouched_product``）；选区外保持原任务预测值。
+    绑定修色：``retouch_report`` 必须已经 :func:`verify_retouch_binding`
+    核验——其 ``region`` 是与成品像素核验所用**完全相同的已验证整数选区**
+    （严格整数语义，且等于请求指纹矩形贴边裁剪后的实际选区）。选区内的
+    点从已核验成品 TIFF 的 CMYK 按原印刷 ICC、原任务意图回算
+    （``verified_retouched_product``）；选区外保持原任务预测值。
     """
     meta = ctx["meta"]
     intent = meta.get(PRESS_INTENT_FIELD, "relative_colorimetric")
