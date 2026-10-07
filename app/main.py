@@ -564,11 +564,14 @@ async def create_acceptance(
         raise HTTPException(422, str(exc))
 
     # 可选修色成品：独立内容绑定核验；不可达/绑定不符一律拒绝，不回退。
+    # verify_retouch_binding 返回的已验证选区是 TIFF 像素核验与逐点内外
+    # 判定的唯一共同依据，后续不再从报告原值自行推导选区。
     retouch_report = None
+    verified_region = None
     verified_tiff = None
     if rid is not None:
         try:
-            retouch_report = ac.verify_retouch_binding(
+            retouch_report, verified_region = ac.verify_retouch_binding(
                 rid, retouch_base, ctx, ctx["cmyk"], press_bytes
             )
             with Image.open(retouch_base / "retouched.tif") as im:
@@ -601,7 +604,7 @@ async def create_acceptance(
         if cached is not None and ac.verify_report_binding(
             cached, acceptance_id, fingerprint, ctx, points, limit_de,
             press_bytes, press_summary_full, rid, retouch_report,
-            verified_tiff, csv_sha,
+            verified_region, verified_tiff, csv_sha,
         ):
             # 报告内容与本次提交逐项一致（含原件摘要）。归档 measurements.csv
             # 若缺失或被另一份字节替换（与报告摘要不符），用本次提交的、摘要
@@ -618,11 +621,11 @@ async def create_acceptance(
     if report is None:
         evaluation = ac.evaluate(
             points, limit_de, ctx, press_bytes, press_summary_full,
-            rid, retouch_report, verified_tiff,
+            rid, retouch_report, verified_region, verified_tiff,
         )
         report = ac.build_report(
             acceptance_id, fingerprint, ctx, points, limit_de,
-            rid, retouch_report, evaluation, csv_sha,
+            rid, retouch_report, verified_region, evaluation, csv_sha,
         )
         csv_path.write_bytes(csv_bytes)
         report_path.write_text(

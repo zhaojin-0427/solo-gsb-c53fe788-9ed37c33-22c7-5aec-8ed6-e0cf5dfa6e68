@@ -7,15 +7,35 @@
 * **不使用修色**：逐点预测 Lab 直接取原任务 ``lab_press.npy``——它是分色
   CMYK 经原印刷 ICC 回算的逐像素预测值；
 * **绑定达标修色成品**：先对成品做**独立的内容绑定核验**（报告绑定本任务、
-  可达、印刷 ICC 摘要一致；``retouched.tif`` 解码后选区外与原分色逐字节
-  相同、选区内恰为报告所记录的统一整数偏移、嵌入的印刷 ICC 字节正确），
-  核验通过后：
+  可达、印刷 ICC 摘要一致、报告 ``request`` 指纹与 retouch_id 严格相符；
+  ``retouched.tif`` 解码后选区外与原分色逐字节相同、选区内恰为报告所记录的
+  统一整数偏移、嵌入的印刷 ICC 字节正确），核验通过后：
 
   - 修色**选区内**测点：从**已核验成品**取该点 CMYK，按**原印刷 ICC 与原
     任务意图**回算为 Lab（策略 ``verified_product_backcalc``——成品选区经
     核验恰为“原分色 + 统一偏移”，因此与“按原分色与偏移重建”在字节与数值
     上等价，这里显式选择从已核验成品回算）；
   - 修色**选区外**测点：保持原任务预测值（``lab_press.npy``）。
+
+**修色选区的整数语义（像素校验与逐点预测共用同一已验证选区）**：
+
+修色请求指纹（报告 ``request``）记录的是用户请求矩形；报告 ``region`` 记录
+的是该矩形与原任务幅面的**实际交点**——请求矩形贴住右/下边缘时按实际交点
+裁剪（如 48×48 图上请求 ``(44,44,16,16)`` 的实际选区为 ``(44,44,4,4)``）。
+验收绑定时：
+
+1. 先严格核验报告 ``request`` 就是 retouch_id 的原像（规范 JSON 之 SHA-256
+   必须等于所绑 retouch_id），且请求中的 ``x/y/width/height/max_shift/
+   tac_limit`` 均为**非布尔整数**、落在修色接口的同一合法范围内，
+   ``job_id``/渲染意图与本任务一致；
+2. 用**该请求矩形与当前原任务幅面重新求交**得到唯一的“已验证选区”，报告
+   ``region`` 必须与它**逐字段精确相等**（不许多余键、不许浮点/布尔、不许
+   贴边裁剪以外的任何偏差——归档报告把 ``x=4,width=1`` 改成 ``x=4.5,
+   width=1.5`` 会在此直接 422，而不是被 ``int()`` 截断默许）；
+3. ``best_offset_cmyk`` 必须是 4 个**非布尔整数**且对已验证选区逐像素满足
+   字节范围 / 单通道上限 / 总墨量上限（与修色搜索同一可行口径）；
+4. **TIFF 逐像素核验与逐点“选区内外”判定使用同一个已验证选区**，绝不允许
+   一边按截断整数核像素、一边按报告原值划内外。
 
 随后把预测 Lab 与 CSV 实测 Lab 逐点计算 CIEDE2000；同坐标复测逐条保留、
 不去重。**任一点 ΔE00 严格大于上限即整张不合格**。
@@ -33,8 +53,9 @@
 原件缺失或摘要不符，则用本次提交的同摘要字节原样修复后复用。
 
 下列情况一律拒绝验收（422/404），绝不用原任务值代替修色测点：修色不可达、
-修色报告或成品与任务/ICC 绑定不符、原印刷 ICC 缺失或摘要不符、测点越界、
-CSV 非法。
+修色报告或成品与任务/ICC 绑定不符、报告指纹与 retouch_id 不符、报告选区/
+偏移不是与请求相符的严格整数记录（含浮点/布尔坐标或偏移、与贴边裁剪结果
+不符的选区）、原印刷 ICC 缺失或摘要不符、测点越界、CSV 非法。
 """
 from __future__ import annotations
 
@@ -68,6 +89,25 @@ class Measurement:
     L: float
     a: float
     b: float
+
+
+@dataclass(frozen=True)
+class VerifiedRegion:
+    """经报告指纹 + 幅面求交双重验证的唯一修色选区。
+
+    TIFF 像素核验与逐点“选区内外”判定必须共用这同一个对象，杜绝“截断
+    整数核像素、原始值划内外”的解释分歧。
+    """
+    x: int
+    y: int
+    width: int
+    height: int
+    offset: tuple[int, int, int, int]
+
+    @property
+    def rect(self) -> dict:
+        return {"x": self.x, "y": self.y,
+                "width": self.width, "height": self.height}
 
 
 # ---------------------------------------------------------------------------
@@ -240,26 +280,127 @@ def verify_press(press_bytes: bytes, digest: str | None) -> None:
         raise AcceptanceError(str(exc))
 
 
+def _strict_int(value, name: str) -> int:
+    """严格整数：拒绝 bool（``True`` 会静默等于 1）与 float（含 1.0/4.5）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AcceptanceError(f"修色报告的 {name} 必须是整数（拒绝布尔/小数值）")
+    return value
+
+
+def verified_region_from_report(
+    rep: dict, retouch_id: str, ctx: dict, cmyk_full: np.ndarray
+) -> VerifiedRegion:
+    """从修色报告推导出**唯一的已验证选区/偏移**。
+
+    依据链：retouch_id（验收请求绑定值）== 报告 ``request`` 完整请求指纹的
+    规范 JSON 之 SHA-256 —— ``request`` 才是用户原始请求（含未裁剪矩形）；
+    报告 ``region`` 必须恰好是该请求矩形与当前原任务幅面的交点。任何分数/
+    布尔坐标或偏移、与请求指纹不符的记录一律 :class:`AcceptanceError`，
+    绝不做 ``int()`` 截断默许。
+    """
+    meta = ctx["meta"]
+    req = rep.get("request")
+    if not isinstance(req, dict):
+        raise AcceptanceError("修色报告缺少完整请求指纹，拒绝验收")
+    # 指纹绑定：报告 request 的原像哈希必须就是所绑 retouch_id，防止归档
+    # 报告的请求/选区/约束被另一份记录替换而仍按 ID 误用。
+    if hashlib.sha256(
+        rt._canonical_json(req).encode("utf-8")
+    ).hexdigest() != retouch_id:
+        raise AcceptanceError(
+            "修色报告请求指纹的 SHA-256 与所绑修色 ID 不符，拒绝验收"
+        )
+    if req.get("job_id") != meta["job_id"]:
+        raise AcceptanceError("修色报告请求指纹绑定的原任务与所选任务不符，拒绝验收")
+    if req.get("source_intent") != meta.get("source_intent"):
+        raise AcceptanceError("修色报告请求指纹的渲染意图与原任务不符，拒绝验收")
+
+    # 请求记录必须与 /api/retouch 同一严格口径：x/y/width/height/max_shift/
+    # tac_limit 为非布尔整数且范围合法，目标 Lab/容差合法（缺失即拒绝）。
+    try:
+        req_validated = rt.validate_request({
+            "job_id": meta["job_id"],
+            "x": req.get("x"),
+            "y": req.get("y"),
+            "width": req.get("width"),
+            "height": req.get("height"),
+            "target_lab": req.get("target_lab"),
+            "tolerance_de": req.get("tolerance_de"),
+            "max_shift": req.get("max_shift"),
+            "tac_limit": req.get("tac_limit"),
+        })
+    except rt.RetouchError as exc:
+        raise AcceptanceError(f"修色报告请求指纹记录非法：{exc}")
+
+    # 请求矩形与当前原任务幅面求交：贴边裁剪后的实际选区（唯一口径）。
+    H, W = cmyk_full.shape[:2]
+    try:
+        vx, vy, vw, vh = rt.clip_region(cmyk_full, req_validated)
+    except rt.RetouchError as exc:
+        raise AcceptanceError(f"修色报告请求矩形超出原任务图像范围：{exc}")
+    expected_region = {"x": int(vx), "y": int(vy),
+                       "width": int(vw), "height": int(vh)}
+
+    # region 逐字段核验。注意 Python 中 True == 1、1.0 == 1，字典相等比较
+    # 无法识别布尔/分数坐标，因此先做严格类型检查：键恰好四个、值全为非布尔
+    # int，再与求交结果精确比较——被改成 x=4.5/width=1.5（或 True）的归档
+    # 报告在此直接 422，绝不 int() 截断默许。
+    region = rep.get("region")
+    region_keys = ("x", "y", "width", "height")
+    if not isinstance(region, dict) or set(region) != set(region_keys):
+        raise AcceptanceError(
+            "修色报告记录的实际选区结构非法（需要且仅需要 x/y/width/height），拒绝验收"
+        )
+    region_strict = {k: _strict_int(region[k], f"region.{k}") for k in region_keys}
+    if region_strict != expected_region:
+        raise AcceptanceError(
+            "修色报告记录的实际选区与请求矩形贴边裁剪后的选区不符，拒绝验收"
+        )
+
+    raw_offset = rep.get("best_offset_cmyk")
+    if not isinstance(raw_offset, list) or len(raw_offset) != 4:
+        raise AcceptanceError("修色报告缺少有效的统一 CMYK 偏移记录，拒绝验收")
+    offset = tuple(_strict_int(v, "best_offset_cmyk") for v in raw_offset)
+
+    # 偏移必须对已验证选区逐像素可行（字节范围/单通道上限/总墨量口径与
+    # 修色搜索完全一致）；不可行偏移不可能产出被核验通过的成品。
+    roi = cmyk_full[vy:vy + vh, vx:vx + vw]
+    if not rt._offset_is_feasible(
+        roi, offset, req_validated.max_shift, req_validated.tac_limit
+    ):
+        raise AcceptanceError(
+            "修色报告记录的统一偏移对已验证选区不满足字节范围/单通道/总墨量"
+            "约束，拒绝验收"
+        )
+
+    return VerifiedRegion(vx, vy, vw, vh, offset)
+
+
 def verify_retouch_binding(
     retouch_id: str,
     retouch_base: Path,
     ctx: dict,
     cmyk_full: np.ndarray,
     press_bytes: bytes,
-) -> dict:
+) -> tuple[dict, VerifiedRegion]:
     """独立核验“达标修色成品”与本任务/原印刷 ICC 的内容绑定。
 
     逐项核对：
 
     * 修色报告存在、结构完整、``reachable == true``、绑定的源任务就是本任务；
+    * 报告 ``request`` 完整请求指纹的 SHA-256 == 所绑 retouch_id，请求整数
+      语义合法；报告 ``region`` 恰为请求矩形与原任务幅面求交（贴边裁剪）后
+      的实际选区、报告偏移为对该选区可行的非布尔整数四元组；
     * 报告记录的印刷 ICC SHA-256 == 当前原印刷 ICC 字节摘要；
     * ``retouched.tif`` 存在、可打开、CMYK、尺寸与原任务一致、嵌入的印刷
       ICC 字节与当前原印刷 ICC 完全相同；
-    * 解码后逐像素核对：报告选区**外**与原分色逐字节相同，选区**内**恰为
-      “原分色 + 报告统一整数偏移”（夹到 0..255，与成品导出路径一致）。
+    * 解码后逐像素核对（用**同一个已验证选区**）：选区**外**与原分色逐字节
+      相同，选区**内**恰为“原分色 + 报告统一整数偏移”（夹到 0..255，与成品
+      导出路径一致）。
 
     任一不符即拒绝验收，绝不在错误的成品上回算、也不用原任务值代替。
-    返回修色报告 dict（供取报告选区/偏移）。
+    返回 ``(修色报告 dict, 已验证选区)``——调用方的逐点内外判定必须复用
+    返回的已验证选区，不得再从报告原值自行推导。
     """
     report_path = retouch_base / "report.json"
     tiff_path = retouch_base / "retouched.tif"
@@ -285,21 +426,12 @@ def verify_retouch_binding(
             "修色报告绑定的印刷 ICC 摘要与原任务当前印刷 ICC 不符，拒绝验收"
         )
 
-    region = rep.get("region")
-    offset = rep.get("best_offset_cmyk")
-    if not isinstance(region, dict) or not isinstance(offset, list) or len(offset) != 4:
-        raise AcceptanceError("修色报告缺少有效的选区/偏移记录，拒绝验收")
-    try:
-        x, y = int(region["x"]), int(region["y"])
-        rw, rh = int(region["width"]), int(region["height"])
-        off = np.asarray([int(v) for v in offset], dtype=np.int32)
-    except (KeyError, TypeError, ValueError):
-        raise AcceptanceError("修色报告的选区/偏移记录非法，拒绝验收")
+    # 唯一的已验证选区/偏移：指纹 + 幅面求交 + 整数/可行性严格核验。
+    verified = verified_region_from_report(rep, retouch_id, ctx, cmyk_full)
+    x, y, rw, rh = verified.x, verified.y, verified.width, verified.height
+    off = np.asarray(verified.offset, dtype=np.int32)
 
     H, W = cmyk_full.shape[:2]
-    if not (0 <= x < W and 0 <= y < H and rw >= 1 and rh >= 1
-            and x + rw <= W and y + rh <= H):
-        raise AcceptanceError("修色报告选区超出原任务图像范围，拒绝验收")
 
     if not tiff_path.is_file():
         raise AcceptanceError("达标修色成品 retouched.tif 缺失，拒绝验收")
@@ -320,7 +452,8 @@ def verify_retouch_binding(
     if embedded != press_bytes:
         raise AcceptanceError("修色成品嵌入的印刷 ICC 与原任务印刷 ICC 字节不符，拒绝验收")
 
-    # 逐像素内容核验：选区外 == 原分色；选区内 == 原分色 + 统一偏移。
+    # 逐像素内容核验（与逐点预测共用 verified 选区）：选区外 == 原分色；
+    # 选区内 == 原分色 + 统一偏移。
     expected = cmyk_full.copy()
     roi = expected[y:y + rh, x:x + rw]
     expected[y:y + rh, x:x + rw] = np.clip(
@@ -330,7 +463,7 @@ def verify_retouch_binding(
         raise AcceptanceError(
             "修色成品像素与“原分色 + 报告统一偏移（选区外字节不变）”不符，拒绝验收"
         )
-    return rep
+    return rep, verified
 
 
 # ---------------------------------------------------------------------------
@@ -341,14 +474,16 @@ def predicted_labs(
     points: list[Measurement],
     ctx: dict,
     press_bytes: bytes,
-    retouch_report: dict | None,
+    verified_region: VerifiedRegion | None,
     verified_tiff: np.ndarray | None,
 ) -> tuple[np.ndarray, list[str]]:
     """按策略返回每个测点的预测 Lab 与来源标记。
 
     无修色：全部取原任务 ``lab_press.npy``（``original_job_prediction``）。
-    绑定修色：报告选区内的点从已核验成品 TIFF 的 CMYK 经原印刷 ICC、原任务
-    意图回算（``verified_retouched_product``）；选区外保持原任务预测值。
+    绑定修色：**已验证选区**内的点从已核验成品 TIFF 的 CMYK 经原印刷 ICC、
+    原任务意图回算（``verified_retouched_product``）；选区外保持原任务预测
+    值。选区与 TIFF 像素核验共用同一个 :class:`VerifiedRegion`，因此“内外
+    判定”与“像素在成品中是否被改写”永远一致。
     """
     meta = ctx["meta"]
     intent = meta.get(PRESS_INTENT_FIELD, "relative_colorimetric")
@@ -361,9 +496,9 @@ def predicted_labs(
     sources = ["original_job_prediction"] * n
     inside = np.zeros(n, dtype=bool)
 
-    if retouch_report is not None:
-        r = retouch_report["region"]
-        x0, y0, x1, y1 = r["x"], r["y"], r["x"] + r["width"], r["y"] + r["height"]
+    if verified_region is not None:
+        x0, y0 = verified_region.x, verified_region.y
+        x1, y1 = x0 + verified_region.width, y0 + verified_region.height
         for i, p in enumerate(points):
             inside[i] = x0 <= p.x < x1 and y0 <= p.y < y1
 
@@ -470,12 +605,13 @@ def evaluate(
     press_summary: dict,
     retouch_id: str | None,
     retouch_report: dict | None,
+    verified_region: VerifiedRegion | None,
     verified_tiff: np.ndarray | None,
 ) -> dict:
     """逐点回算预测 Lab、计算 ΔE00 并给出整张判定。"""
     meta = ctx["meta"]
     predicted, sources = predicted_labs(
-        points, ctx, press_bytes, retouch_report, verified_tiff
+        points, ctx, press_bytes, verified_region, verified_tiff
     )
     measured = np.array([[p.L, p.a, p.b] for p in points], dtype=np.float64)
     n = len(points)
@@ -544,6 +680,7 @@ def build_report(
     limit_de: float,
     retouch_id: str | None,
     retouch_report: dict | None,
+    verified_region: VerifiedRegion | None,
     evaluation: dict,
     csv_sha256: str,
 ) -> dict:
@@ -565,8 +702,10 @@ def build_report(
         "retouch": (
             {
                 "retouch_id": retouch_id,
-                "region": retouch_report["region"],
-                "best_offset_cmyk": retouch_report["best_offset_cmyk"],
+                # 写入**已验证选区/偏移**（与像素核验、逐点判定同一来源），
+                # 不照抄可能被改写的报告原值。
+                "region": verified_region.rect,
+                "best_offset_cmyk": list(verified_region.offset),
                 "reachable": True,
             }
             if retouch_id is not None
@@ -611,6 +750,7 @@ def verify_report_binding(
     press_summary: dict,
     retouch_id: str | None,
     retouch_report: dict | None,
+    verified_region: VerifiedRegion | None,
     verified_tiff: np.ndarray | None,
     csv_sha256: str,
 ) -> bool:
@@ -637,7 +777,7 @@ def verify_report_binding(
             return False
         expected = evaluate(
             points, limit_de, ctx, press_bytes, press_summary,
-            retouch_id, retouch_report, verified_tiff,
+            retouch_id, retouch_report, verified_region, verified_tiff,
         )
         if report.get("passed") != expected["passed"]:
             return False
@@ -671,9 +811,24 @@ def verify_report_binding(
             rr = report.get("retouch")
             if not isinstance(rr, dict) or rr.get("retouch_id") != retouch_id:
                 return False
-            if rr.get("region") != retouch_report["region"]:
+            # 与**已验证选区**（请求矩形贴边裁剪后的实际交点）逐项一致，
+            # 不直接相信缓存报告里的 region/offset 原值。注意 True==1、
+            # 4.0==4：类型必须也是非布尔 int，防止归档报告被改成等价值。
+            cached_region = rr.get("region")
+            if not isinstance(cached_region, dict) or \
+                    set(cached_region) != set(verified_region.rect):
                 return False
-            if rr.get("best_offset_cmyk") != retouch_report["best_offset_cmyk"]:
+            for k, v in verified_region.rect.items():
+                cv = cached_region.get(k)
+                if isinstance(cv, bool) or not isinstance(cv, int) or cv != v:
+                    return False
+            cached_off = rr.get("best_offset_cmyk")
+            if not isinstance(cached_off, list) or len(cached_off) != 4:
+                return False
+            for cv, v in zip(cached_off, verified_region.offset):
+                if isinstance(cv, bool) or not isinstance(cv, int) or cv != v:
+                    return False
+            if rr.get("reachable") is not True:
                 return False
         elif report.get("retouch") is not None:
             return False
@@ -683,7 +838,11 @@ def verify_report_binding(
 
 
 def list_retouches_for_job(retouch_dir: Path, job_id: str) -> list[dict]:
-    """列出某任务下可用于印后验收的**达标**修色成品（扫描内容寻址目录）。"""
+    """列出某任务下可用于印后验收的**达标**修色成品（扫描内容寻址目录）。
+
+    列表只做展示性读取：选区/偏移记录不是严格整数结构（被改成浮点/布尔或
+    结构损坏）的报告一律跳过——真正的绑定核验在提交验收时逐项执行。
+    """
     out: list[dict] = []
     if not retouch_dir.exists():
         return out
@@ -702,10 +861,21 @@ def list_retouches_for_job(retouch_dir: Path, job_id: str) -> list[dict]:
         if rep.get("reachable") is not True or not (d / "retouched.tif").is_file():
             # 不可达修色没有成品，不能用于印后验收。
             continue
+        region = rep.get("region")
+        offset = rep.get("best_offset_cmyk")
+        if not (isinstance(region, dict)
+                and all(isinstance(region.get(k), int)
+                        and not isinstance(region.get(k), bool)
+                        for k in ("x", "y", "width", "height"))):
+            continue
+        if not (isinstance(offset, list) and len(offset) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        for v in offset)):
+            continue
         out.append({
             "retouch_id": rep.get("retouch_id") or d.name,
-            "region": rep.get("region"),
-            "best_offset_cmyk": rep.get("best_offset_cmyk"),
+            "region": region,
+            "best_offset_cmyk": offset,
             "reachable": True,
         })
     return out

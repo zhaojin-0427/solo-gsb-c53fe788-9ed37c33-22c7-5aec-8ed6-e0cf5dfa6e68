@@ -508,6 +508,271 @@ def test_retouch_tiff_with_foreign_icc_rejected(client, ids):
 
 
 # --------------------------------------------------------------------------
+# 修色报告选区/偏移的整数语义：像素校验与逐点预测必须共用同一已验证选区
+# --------------------------------------------------------------------------
+
+def _retouch_report_path(client, retouch_id):
+    from app import main
+    return main.RETOUCH_DIR / retouch_id / "report.json"
+
+
+def _restore_retouch(client, job_id, rt_payload):
+    """按报告记录的请求重新提交修色，恢复被测试改写的归档报告/成品。"""
+    rep = rt_payload["report"]
+    req = rep["request"]
+    client.post("/api/retouch", json={
+        "job_id": job_id,
+        "x": req["x"], "y": req["y"],
+        "width": req["width"], "height": req["height"],
+        "target_lab": req["target_lab"],
+        "tolerance_de": req["tolerance_de"],
+        "max_shift": req["max_shift"],
+        "tac_limit": req["tac_limit"],
+    })
+
+
+def test_fractional_report_region_rejected_not_truncated(client, ids):
+    """归档报告把 x=4,width=1 改为 x=4.5,width=1.5：原 TIFF 仍与截断选区
+    字节相符，但分数坐标必须直接 422，绝不能 int() 截断默许。
+
+    旧实现下截断像素核验通过、逐点内外却按 4.5..6.0 划分，x=5 的测点会被
+    错误地当成选区内、从成品（该列实为未修色原分色）回算。
+    """
+    job = _run_job(client, ids, png=_gradient_png())
+    job_id = job["job_id"]
+    rtj = _retouch_reachable(client, job_id, offset=(3, 0, 0, 0),
+                             rect=(4, 4, 1, 1), ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    rep = json.loads(rep_path.read_text("utf-8"))
+    assert rep["region"] == {"x": 4, "y": 4, "width": 1, "height": 1}
+    rep["region"] = {"x": 4.5, "y": 4, "width": 1.5, "height": 1}
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    try:
+        # 选区内（按原选区）测点与被错误划入的 x=5 测点都必须随绑定 422。
+        r = _accept(client, job_id, _csv([(4, 4, 50, 0, 0)]),
+                    retouch_id=rtj["retouch_id"])
+        assert r.status_code == 422
+        assert "整数" in r.json()["detail"] or "选区" in r.json()["detail"]
+        r2 = _accept(client, job_id, _csv([(5, 4, 50, 0, 0)]),
+                     retouch_id=rtj["retouch_id"])
+        assert r2.status_code == 422
+        # 同一成品在“不绑定修色”路径下仍可正常验收（拒绝只针对错误绑定）。
+        r3 = _accept(client, job_id, _csv([(5, 4, 50, 0, 0)]))
+        assert r3.status_code == 200
+    finally:
+        _restore_retouch(client, job_id, rtj)
+
+
+def test_integer_valued_float_region_rejected(client, ids):
+    """region 写成 4.0/1.0 这种“整数值的浮点”也必须拒绝（不做静默接受）。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rtj = _retouch_reachable(client, job["job_id"], ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    rep = json.loads(rep_path.read_text("utf-8"))
+    rep["region"] = {"x": 4.0, "y": 4.0, "width": 16.0, "height": 16.0}
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    try:
+        r = _accept(client, job["job_id"], _csv([(8, 8, 50, 0, 0)]),
+                    retouch_id=rtj["retouch_id"])
+        assert r.status_code == 422
+    finally:
+        _restore_retouch(client, job["job_id"], rtj)
+
+
+def test_bool_region_coordinate_rejected(client, ids):
+    """布尔值（True 在 Python 中 == 1）不得被当作整数坐标接受。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rtj = _retouch_reachable(client, job["job_id"], ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    rep = json.loads(rep_path.read_text("utf-8"))
+    rep["region"] = {"x": True, "y": 4, "width": 16, "height": 16}
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    try:
+        r = _accept(client, job["job_id"], _csv([(8, 8, 50, 0, 0)]),
+                    retouch_id=rtj["retouch_id"])
+        assert r.status_code == 422
+    finally:
+        _restore_retouch(client, job["job_id"], rtj)
+
+
+def test_fractional_or_bool_offset_rejected(client, ids):
+    """best_offset_cmyk 出现浮点（含 3.0）或布尔值一律 422。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rtj = _retouch_reachable(client, job["job_id"], offset=(3, 0, 0, 0),
+                             rect=(4, 4, 8, 8), ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    original_rep = rep_path.read_text("utf-8")
+    for bad_offset in ([3.0, 0, 0, 0], [3.5, 0, 0, 0], [True, 0, 0, 0]):
+        rep = json.loads(original_rep)
+        rep["best_offset_cmyk"] = bad_offset
+        rep_path.write_text(json.dumps(rep), "utf-8")
+        r = _accept(client, job["job_id"], _csv([(5, 5, 50, 0, 0)]),
+                    retouch_id=rtj["retouch_id"])
+        assert r.status_code == 422, (bad_offset, r.text)
+    rep_path.write_text(original_rep)
+
+
+def test_request_fingerprint_not_matching_retouch_id_rejected(client, ids):
+    """报告 request 指纹与所绑 retouch_id 不符（指纹被换/缺失）一律 422。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rtj = _retouch_reachable(client, job["job_id"], ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    original_rep = rep_path.read_text("utf-8")
+    # 指纹字段存在但矩形被改成另一请求（SHA-256 不再等于 retouch_id）。
+    rep = json.loads(original_rep)
+    rep["request"]["x"] = 5
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    r = _accept(client, job["job_id"], _csv([(8, 8, 50, 0, 0)]),
+                retouch_id=rtj["retouch_id"])
+    assert r.status_code == 422
+    assert "指纹" in r.json()["detail"]
+    # 缺失 request 同样拒绝。
+    rep = json.loads(original_rep)
+    del rep["request"]
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    r = _accept(client, job["job_id"], _csv([(8, 8, 50, 0, 0)]),
+                retouch_id=rtj["retouch_id"])
+    assert r.status_code == 422
+    rep_path.write_text(original_rep)
+
+
+def test_integer_region_disagreeing_with_request_rejected(client, ids):
+    """region 改成另一个*整数*矩形（与请求指纹求交结果不符）：像素核验或
+    选区比对必须拦下，不能用错误选区划内外。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    rtj = _retouch_reachable(client, job["job_id"], offset=(3, 0, 0, 0),
+                             rect=(4, 4, 1, 1), ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    original_rep = rep_path.read_text("utf-8")
+    rep = json.loads(original_rep)
+    # 宽度从 1 改成 2：成品只改了第 4 列，期望第 5 列也被改 → 像素核验不符。
+    rep["region"] = {"x": 4, "y": 4, "width": 2, "height": 1}
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    r = _accept(client, job["job_id"], _csv([(5, 4, 50, 0, 0)]),
+                retouch_id=rtj["retouch_id"])
+    assert r.status_code == 422
+    rep_path.write_text(original_rep)
+
+
+def test_region_extra_keys_rejected(client, ids):
+    job = _run_job(client, ids, png=_gradient_png())
+    rtj = _retouch_reachable(client, job["job_id"], ids=ids)
+    rep_path = _retouch_report_path(client, rtj["retouch_id"])
+    original_rep = rep_path.read_text("utf-8")
+    rep = json.loads(original_rep)
+    rep["region"] = {"x": 4, "y": 4, "width": 16, "height": 16, "unit": "px"}
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    try:
+        r = _accept(client, job["job_id"], _csv([(8, 8, 50, 0, 0)]),
+                    retouch_id=rtj["retouch_id"])
+        assert r.status_code == 422
+    finally:
+        rep_path.write_text(original_rep)
+
+
+def test_edge_clipped_region_used_for_pixel_check_and_point_split(client, ids):
+    """合法贴边修色：48×48 图上请求 (44,44,16,16) 实际选区为 (44,44,4,4)。
+
+    像素核验与逐点内外都必须按裁剪后的选区：(47,47) 在选区内（成品回算），
+    (40,40) 在选区外（原任务预测值）。
+    """
+    job = _run_job(client, ids, png=_gradient_png())
+    job_id = job["job_id"]
+    rtj = _retouch_reachable(client, job_id, offset=(3, 0, 0, 0),
+                             rect=(44, 44, 16, 16), ids=ids)
+    assert rtj["rect"] == {"x": 44, "y": 44, "width": 4, "height": 4}
+    # 报告 request 仍记录用户请求的原始矩形（16×16），region 是裁剪结果。
+    req = rtj["report"]["request"]
+    assert (req["x"], req["y"], req["width"], req["height"]) == (44, 44, 16, 16)
+    assert rtj["report"]["region"] == {"x": 44, "y": 44,
+                                       "width": 4, "height": 4}
+
+    from app import main
+    press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    with Image.open(main.RETOUCH_DIR / rtj["retouch_id"] / "retouched.tif") as im:
+        tiff = np.asarray(im)
+    lab_in = lcms_native.pixels_to_lab(
+        tiff[47:48, 47:48].reshape(1, 4), "CMYK", press,
+        "relative_colorimetric"
+    )[0]
+    lab_out = np.load(main.JOB_DIR / job_id / "lab_press.npy")[40, 40]
+    rows = [
+        (47, 47, *[float(v) for v in lab_in]),
+        (40, 40, *[float(v) for v in lab_out]),
+    ]
+    r = _accept(client, job_id, _csv(rows), limit=0.0,
+                retouch_id=rtj["retouch_id"])
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["passed"] is True
+    assert d["points"][0]["prediction_source"] == "verified_retouched_product"
+    assert d["points"][1]["prediction_source"] == "original_job_prediction"
+    assert d["report"]["retouch"]["region"] == rtj["rect"]
+
+
+def test_edge_clipped_pixel_check_and_prediction_share_region(client, ids):
+    """贴边成品上“像素核验通过的最右列”与“逐点判定的选区内”必须是同一列：
+    实测取成品回算值时合格；实测给原任务值时该点必须超限（证明未误判为
+    选区外）。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    job_id = job["job_id"]
+    rtj = _retouch_reachable(client, job_id, offset=(8, 0, 0, 0),
+                             rect=(44, 44, 16, 16), ids=ids)
+    from app import main
+    press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    with Image.open(main.RETOUCH_DIR / rtj["retouch_id"] / "retouched.tif") as im:
+        tiff = np.asarray(im)
+    prod_lab = lcms_native.pixels_to_lab(
+        tiff[47:48, 47:48].reshape(1, 4), "CMYK", press,
+        "relative_colorimetric"
+    )[0]
+    job_lab = np.load(main.JOB_DIR / job_id / "lab_press.npy")[47, 47]
+    assert float(np.abs(np.asarray(prod_lab) - job_lab).max()) > 0.5
+    # 原任务值当实测：绑定修色时最右列按成品回算 → 超限（被正确划入选区）。
+    rows = [(47, 47, *[float(v) for v in job_lab])]
+    r = _accept(client, job_id, _csv(rows), limit=0.2,
+                retouch_id=rtj["retouch_id"])
+    assert r.status_code == 200
+    assert r.json()["passed"] is False
+    assert r.json()["points"][0]["prediction_source"] == \
+        "verified_retouched_product"
+    # 成品回算值当实测：合格。
+    rows_ok = [(47, 47, *[float(v) for v in prod_lab])]
+    r2 = _accept(client, job_id, _csv(rows_ok), limit=0.0,
+                 retouch_id=rtj["retouch_id"])
+    assert r2.json()["passed"] is True
+
+
+def test_same_coordinates_remeasured_with_retouch_kept_separately(client, ids):
+    """绑定修色时同坐标复测仍逐条保留、各自判定。"""
+    job = _run_job(client, ids, png=_gradient_png())
+    job_id = job["job_id"]
+    rtj = _retouch_reachable(client, job_id, offset=(3, 0, 0, 0),
+                             rect=(4, 4, 8, 8), ids=ids)
+    from app import main
+    press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    with Image.open(main.RETOUCH_DIR / rtj["retouch_id"] / "retouched.tif") as im:
+        tiff = np.asarray(im)
+    lab_in = lcms_native.pixels_to_lab(
+        tiff[5:6, 5:6].reshape(1, 4), "CMYK", press,
+        "relative_colorimetric"
+    )[0]
+    rows = [
+        (5, 5, *[float(v) for v in lab_in]),
+        (5, 5, 30.0, 40.0, -40.0),
+    ]
+    r = _accept(client, job_id, _csv(rows), limit=1.0,
+                retouch_id=rtj["retouch_id"])
+    assert r.status_code == 200
+    d = r.json()
+    assert d["point_count"] == 2
+    assert all(p["prediction_source"] == "verified_retouched_product"
+               for p in d["points"])
+    assert d["points"][0]["over_limit"] is False
+    assert d["points"][1]["over_limit"] is True
+
+
+# --------------------------------------------------------------------------
 # 确定性 / 报告 / 产物
 # --------------------------------------------------------------------------
 
